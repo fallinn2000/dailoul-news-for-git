@@ -1,0 +1,174 @@
+.
+├── index.html                 # ملف موقعك (سنضيف له علامات قسم آلي)
+├── scripts/
+│   ├── scrape_rimnow.py       # يسحب العناوين ويجهّز بطاقات HTML
+│   └── update_index.py        # يحقن البطاقات داخل index.html بين علامتين
+├── requirements.txt           # مكتبات بايثون
+└── .github/
+    └── workflows/
+        └── update.yml         # GitHub Action للتشغيل المجدول أو اليدوي
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+python-dateutil==2.9.0.post0
+<!-- START AUTO -->
+<!-- سيتم استبدال هذا القسم آليًا -->
+<div class="text-slate-500">جاري جلب آخر التعليقات الساخرة…</div>
+<!-- END AUTO -->
+# scripts/scrape_rimnow.py
+import re, time, json, hashlib
+from urllib.parse import urljoin
+import requests
+from bs4 import BeautifulSoup
+
+BASE = "https://www.rimnow.net/"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; RimSatireBot/1.0; +https://fallinn2000.github.io/dailoul-news-for-git/)"
+}
+
+def normalize(text):
+    t = re.sub(r"\s+", " ", text or "").strip()
+    # إزالة رموز شائعة
+    t = re.sub(r"[^\w\u0600-\u06FF ]+", "", t, flags=re.UNICODE)
+    return t
+
+def fetch_home():
+    r = requests.get(BASE, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+def parse_titles(html):
+    soup = BeautifulSoup(html, "lxml")
+    # جرب انتقاء الروابط النصية في الكتل الرئيسية
+    links = []
+    for a in soup.select("a"):
+        txt = a.get_text(strip=True)
+        href = a.get("href")
+        if not txt or not href:
+            continue
+        if len(txt) < 12:  # تجاهل القصير جداً
+            continue
+        if href.startswith("#"):
+            continue
+        links.append((normalize(txt), urljoin(BASE, href)))
+    return links
+
+def top_topics(links, k=5):
+    # تجميع بالعناوين النظيفة
+    counts = {}
+    first_url = {}
+    for title, url in links:
+        key = title
+        counts[key] = counts.get(key, 0) + 1
+        if key not in first_url:
+            first_url[key] = url
+    # ترتيب بالتكرار ثم بالعنوان
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:k]
+    items = []
+    for title, cnt in ranked:
+        items.append({"title": title, "url": first_url[title], "count": cnt})
+    return items
+
+if __name__ == "__main__":
+    html = fetch_home()
+    links = parse_titles(html)
+    items = top_topics(links, k=5)
+    print(json.dumps({"items": items}, ensure_ascii=False))
+# scripts/update_index.py
+import os, sys, json, re, datetime
+from pathlib import Path
+from subprocess import check_output
+
+ROOT = Path(__file__).resolve().parents[1]
+INDEX = ROOT / "index.html"
+
+CARD_TMPL = """\
+<article class="card rounded-3xl bg-white border border-slate-200 shadow p-6">
+  <div class="flex items-start justify-between gap-4">
+    <div>
+      <h3 class="text-2xl font-extrabold">{title}</h3>
+      <p class="text-sm text-slate-500 mt-1">مصدر: موريتانيا الآن — تكرار العنوان: {count}×</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <a class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm bg-slate-100 text-slate-700 hover:bg-slate-200" href="{url}" target="_blank" rel="noopener">الرابط الأصلي</a>
+    </div>
+  </div>
+  <p class="mt-4 leading-8">
+    تعليق مهذّب: العنوان يتردّد كأنه لازمة أسبوعية… لعلّ الحلّ ليس في تكرار الأخبار، بل في تكرار الحلول 🙃
+  </p>
+</article>"""
+
+def run(cmd):
+    return check_output(cmd, shell=True, text=True)
+
+def render_cards():
+    # استدعاء السكربت السابق للحصول على أفضل 5
+    data = run(f"{sys.executable} scripts/scrape_rimnow.py")
+    items = json.loads(data)["items"]
+    cards = []
+    for it in items:
+        cards.append(CARD_TMPL.format(title=it["title"], url=it["url"], count=it["count"]))
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    header = f'<div class="text-sm text-slate-500 mb-3">آخر تحديث تلقائي: {now}</div>'
+    return header + "\n" + "\n".join(cards)
+
+def replace_between(text, start_mark, end_mark, new_html):
+    pattern = re.compile(
+        r"(?s)(" + re.escape(start_mark) + r")(.*?)(" + re.escape(end_mark) + r")"
+    )
+    if not pattern.search(text):
+        raise SystemExit("لم أجد العلامتين START/END داخل index.html")
+    return pattern.sub(r"\1\n" + new_html + r"\n\3", text)
+
+if __name__ == "__main__":
+    html = INDEX.read_text(encoding="utf-8")
+    new_block = render_cards()
+    out = replace_between(html, "<!-- START AUTO -->", "<!-- END AUTO -->", new_block)
+    if out != html:
+        INDEX.write_text(out, encoding="utf-8")
+        print("index.html updated")
+    else:
+        print("no changes")
+name: Auto-update site from RimNow
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC = 09:00 قطر
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Scrape & update index.html
+        run: |
+          python scripts/update_index.py
+
+      - name: Commit & push if changed
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "Auto-update: RimNow feed"
+            git push
+          else
+            echo "No changes"
+          fi
